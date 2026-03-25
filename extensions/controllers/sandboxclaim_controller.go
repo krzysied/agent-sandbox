@@ -29,15 +29,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
@@ -48,6 +52,7 @@ var ErrTemplateNotFound = errors.New("SandboxTemplate not found")
 type SandboxClaimReconciler struct {
 	client.Client
 	Scheme                  *runtime.Scheme
+	WarmSandboxQueue        queue.SandboxQueue
 	Recorder                record.EventRecorder
 	Tracer                  asmetrics.Instrumenter
 	MaxConcurrentReconciles int
@@ -129,17 +134,37 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		sandbox, reconcileErr = r.reconcileActive(ctx, claim)
 	}
 
-	// Update Status & Events
-	r.computeAndSetStatus(claim, sandbox, reconcileErr, claimExpired)
+	updateAttempt := 0
+	for {
+		updateAttempt++
+		if updateAttempt > 10 {
+			log.Info(fmt.Sprintf("[debug] %v/%v claim status update failed 10 times. Abort", claim.Namespace, claim.Name))
+			break
+		}
+		// Update Status & Events
+		if err := r.Get(ctx, req.NamespacedName, claim); err != nil {
+			if k8errors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("failed to get sandbox claim %q: %w", req.NamespacedName, err)
+		}
+		r.computeAndSetStatus(claim, sandbox, reconcileErr, claimExpired)
+		if updateErr := r.updateStatus(ctx, originalClaimStatus, claim); updateErr != nil {
+			if k8errors.IsConflict(updateErr) {
+				log.Info(fmt.Sprintf("[debug] conflict on %v/%v claim status update. Retry", claim.Namespace, claim.Name))
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return ctrl.Result{}, errors.Join(reconcileErr, updateErr)
+		}
+		break
+	}
+	log.Info(fmt.Sprintf("[debug] success on %v/%v claim status update", claim.Namespace, claim.Name))
 
 	if !hasExpiredCondition(originalClaimStatus.Conditions) && hasExpiredCondition(claim.Status.Conditions) {
 		if r.Recorder != nil {
 			r.Recorder.Event(claim, corev1.EventTypeNormal, extensionsv1alpha1.ClaimExpiredReason, "Claim expired")
 		}
-	}
-
-	if updateErr := r.updateStatus(ctx, originalClaimStatus, claim); updateErr != nil {
-		return ctrl.Result{}, errors.Join(reconcileErr, updateErr)
 	}
 
 	r.recordCreationLatencyMetric(claim, originalClaimStatus, sandbox)
@@ -340,40 +365,37 @@ func (r *SandboxClaimReconciler) computeAndSetStatus(claim *extensionsv1alpha1.S
 }
 
 // adoptSandboxFromCandidates picks the best candidate and transfers ownership to the claim.
-func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, candidates []*v1alpha1.Sandbox) (*v1alpha1.Sandbox, error) {
+func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim) (*v1alpha1.Sandbox, error) {
 	log := log.FromContext(ctx)
 
-	// Sort: ready sandboxes first, then by creation time (oldest first)
-	sort.Slice(candidates, func(i, j int) bool {
-		iReady := isSandboxReady(candidates[i])
-		jReady := isSandboxReady(candidates[j])
-		if iReady != jReady {
-			return iReady
+	templateHash := sandboxcontrollers.NameHash(claim.Spec.TemplateRef.Name)
+	// Spin until there are candiates
+	for {
+		log.Info(fmt.Sprintf("[debug] %v template %v", claim.Name, templateHash))
+		log.Info(fmt.Sprintf("[debug] %v template %v: queue lenght %d", claim.Name, templateHash, r.WarmSandboxQueue.Len(templateHash)))
+		adoptedKey, ok := r.WarmSandboxQueue.Get(templateHash)
+		if !ok {
+			// No sandboxes, exit adoption loop.
+			log.Info(fmt.Sprintf("[debug] %v no sandboxes to adopt", claim.Name))
+			break
 		}
-		return candidates[i].CreationTimestamp.Before(&candidates[j].CreationTimestamp)
-	})
+		// TODO(krzysied): properly handle defer.
+		defer r.WarmSandboxQueue.Done(templateHash, adoptedKey)
 
-	if len(candidates) == 0 {
-		log.Info("No warm pool candidates available, falling through to cold start")
-		return nil, nil
-	}
-
-	// Determine the search range for collision avoidance.
-	n := len(candidates)
-	workerCount := r.MaxConcurrentReconciles
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-	searchWindow := min(n, workerCount)
-
-	// Compute a starting index deterministic to this specific Claim UID.
-	hashValue := sandboxcontrollers.GetNumericHash(string(claim.UID))
-	startIndex := int(hashValue % uint32(searchWindow))
-
-	// Iterate through the entire list starting from the hashed offset.
-	for i := 0; i < n; i++ {
-		currIndex := (startIndex + i) % n
-		adopted := candidates[currIndex]
+		log.Info(fmt.Sprintf("[debug] %v trying to adopt %v", claim.Name, adoptedKey))
+		adopted := &v1alpha1.Sandbox{}
+		err := r.Get(ctx, client.ObjectKey(adoptedKey), adopted)
+		if err != nil {
+			if k8errors.IsNotFound(err) {
+				// Sandbox is gone.
+				continue
+			}
+			return nil, err
+		}
+		if err := verifySandboxCandidate(adopted, claim); err != nil {
+			log.Error(err, fmt.Sprintf("[debug] sandbox %v/%v can't be addopted for template %v", adopted.Namespace, adopted.Name, templateHash))
+			continue
+		}
 
 		// Extract pool name from owner reference before clearing
 		poolName := "none"
@@ -381,7 +403,7 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			poolName = controllerRef.Name
 		}
 
-		log.Info(fmt.Sprintf("Attempting sandbox adoption: sandbox=%s, pool=%s", adopted.Name, poolName))
+		log.Info(fmt.Sprintf("[debug] Attempting sandbox adoption: sandbox=%s, pool=%s", adopted.Name, poolName))
 
 		// Remove warm pool labels so the sandbox no longer appears in warm pool queries
 		delete(adopted.Labels, warmPoolSandboxLabel)
@@ -410,15 +432,22 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 		// Update uses optimistic concurrency (resourceVersion) so concurrent
 		// claims racing to adopt the same sandbox will conflict and retry.
 		if err := r.Update(ctx, adopted); err != nil {
-			if k8errors.IsConflict(err) || k8errors.IsNotFound(err) {
-				// Another worker adopted this sandbox while we were processing; try next candidate.
+			if k8errors.IsConflict(err) {
+				// Unexpected conflic. Requeue key.
+				r.WarmSandboxQueue.Add(templateHash, adoptedKey)
 				continue
 			}
-			log.Error(err, "Failed to update adopted sandbox")
+			if k8errors.IsNotFound(err) {
+				// Sandbox removed. Try new candidate.
+				continue
+			}
+			// Unexpected error. Requeue key.
+			r.WarmSandboxQueue.Add(templateHash, adoptedKey)
+			log.Error(err, fmt.Sprintf("[debug] Failed to update adopted sandbox %v/%v", adopted.Namespace, adopted.Name))
 			return nil, err
 		}
 
-		log.Info("Successfully adopted sandbox from warm pool", "sandbox", adopted.Name, "claim", claim.Name)
+		log.Info("[debug] Successfully adopted sandbox from warm pool", "sandbox", adopted.Name, "claim", claim.Name)
 
 		if r.Recorder != nil {
 			r.Recorder.Event(claim, corev1.EventTypeNormal, "SandboxAdopted", fmt.Sprintf("Adopted warm pool Sandbox %q", adopted.Name))
@@ -570,51 +599,12 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 		return sandbox, nil
 	}
 
-	// Single List: ownership guard + adoption candidate scan.
-	// This queries the informer cache (not the API server), so it's fast.
-	allSandboxes := &v1alpha1.SandboxList{}
-	if err := r.List(ctx, allSandboxes, client.InNamespace(claim.Namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list sandboxes: %w", err)
+	adopted, err := r.adoptSandboxFromCandidates(ctx, claim)
+	if err != nil {
+		return nil, err
 	}
-
-	templateHash := sandboxcontrollers.NameHash(claim.Spec.TemplateRef.Name)
-	var adoptionCandidates []*v1alpha1.Sandbox
-
-	for i := range allSandboxes.Items {
-		sb := &allSandboxes.Items[i]
-		if !sb.DeletionTimestamp.IsZero() {
-			continue
-		}
-
-		// Ownership guard: if this claim already owns a sandbox, return it
-		if metav1.IsControlledBy(sb, claim) {
-			logger.Info("found existing owned sandbox", "name", sb.Name)
-			return sb, nil
-		}
-
-		// Collect adoption candidates from warm pool
-		if _, ok := sb.Labels[warmPoolSandboxLabel]; !ok {
-			continue
-		}
-		if sb.Labels[sandboxTemplateRefHash] != templateHash {
-			continue
-		}
-		controllerRef := metav1.GetControllerOf(sb)
-		if controllerRef != nil && controllerRef.Kind != "SandboxWarmPool" {
-			continue
-		}
-		adoptionCandidates = append(adoptionCandidates, sb)
-	}
-
-	// Try to adopt from warm pool
-	if len(adoptionCandidates) > 0 {
-		adopted, err := r.adoptSandboxFromCandidates(ctx, claim, adoptionCandidates)
-		if err != nil {
-			return nil, err
-		}
-		if adopted != nil {
-			return adopted, nil
-		}
+	if adopted != nil {
+		return adopted, nil
 	}
 
 	// No warm pool sandbox available; caller decides whether to create
@@ -644,6 +634,7 @@ func (r *SandboxClaimReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWo
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&extensionsv1alpha1.SandboxClaim{}).
 		Owns(&v1alpha1.Sandbox{}).
+		Watches(&v1alpha1.Sandbox{}, &sandboxEventHandler{sandboxQueue: r.WarmSandboxQueue}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Complete(r)
 }
@@ -772,4 +763,81 @@ func hasExpiredCondition(conditions []metav1.Condition) bool {
 		}
 	}
 	return false
+}
+
+// sandboxEventHandler implements handler.EventHandler for the SandboxClaimReconciler.
+// It populates sandbox queue
+type sandboxEventHandler struct {
+	sandboxQueue queue.SandboxQueue
+}
+
+func (h *sandboxEventHandler) Create(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	h.Update(ctx, event.UpdateEvent{ObjectOld: &v1alpha1.Sandbox{}, ObjectNew: e.Object}, q)
+}
+
+func (h *sandboxEventHandler) Update(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	newSandbox, ok := e.ObjectNew.(*v1alpha1.Sandbox)
+	if !ok {
+		return
+	}
+	oldSandbox, ok := e.ObjectOld.(*v1alpha1.Sandbox)
+	if !ok {
+		return
+	}
+
+	newAdoptable := isAdoptable(newSandbox) == nil
+	oldAdoptable := isAdoptable(oldSandbox) == nil
+
+	logger := log.FromContext(ctx)
+	//logger.Info(fmt.Sprintf("[debug] newSandbox %v, newAdoptable %v", newSandbox, newAdoptable))
+	//logger.Info(fmt.Sprintf("[debug] oldSandbox %v, oldAdoptable %v", oldSandbox, oldAdoptable))
+
+	if !oldAdoptable && newAdoptable {
+		// Add sandbox only on to adoptable transition.
+		key := queue.SandboxKey{
+			Namespace: newSandbox.Namespace,
+			Name:      newSandbox.Name,
+		}
+		logger.Info(fmt.Sprintf("[debug] Adding %v for template %v", newSandbox.Labels[sandboxTemplateRefHash], key))
+		h.sandboxQueue.Add(newSandbox.Labels[sandboxTemplateRefHash], key)
+		logger.Info(fmt.Sprintf("[debug] After adding queue lenght for template %v: %d", newSandbox.Labels[sandboxTemplateRefHash], h.sandboxQueue.Len(newSandbox.Labels[sandboxTemplateRefHash])))
+	}
+}
+
+func (h *sandboxEventHandler) Delete(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	// Sandbox deletion is handled by adaption logic.
+}
+
+func (h *sandboxEventHandler) Generic(ctx context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	// Generic events are not typically used for pod lifecycle changes we care about.
+}
+
+func verifySandboxCandidate(candidate *v1alpha1.Sandbox, claim *extensionsv1alpha1.SandboxClaim) error {
+	if err := isAdoptable(candidate); err != nil {
+		return err
+	}
+
+	templateHash := sandboxcontrollers.NameHash(claim.Spec.TemplateRef.Name)
+	if candidate.Labels[sandboxTemplateRefHash] != templateHash {
+		return fmt.Errorf("incorrect teplate hash, expected %v, got %v", templateHash, candidate.Labels[sandboxTemplateRefHash])
+	}
+	return nil
+}
+
+func isAdoptable(candidate *v1alpha1.Sandbox) error {
+	if !candidate.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("sandbox is deleted")
+	}
+	if _, ok := candidate.Labels[warmPoolSandboxLabel]; !ok {
+		return fmt.Errorf("sandbox is missing the warm pool sandbox label")
+	}
+	if _, ok := candidate.Labels[sandboxTemplateRefHash]; !ok {
+		return fmt.Errorf("sandbox is missing the sandbox template ref hash label")
+	}
+
+	controllerRef := metav1.GetControllerOf(candidate)
+	if controllerRef != nil && controllerRef.Kind != "SandboxWarmPool" {
+		return fmt.Errorf("sandbox is not managed by warm pool. Controller: %v", controllerRef)
+	}
+	return nil
 }

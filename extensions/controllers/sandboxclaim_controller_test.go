@@ -39,6 +39,7 @@ import (
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
@@ -439,10 +440,23 @@ func TestSandboxClaimReconcile(t *testing.T) {
 			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(allObjects...).WithStatusSubresource(claimToUse).Build()
 
 			reconciler := &SandboxClaimReconciler{
-				Client:   client,
-				Scheme:   scheme,
-				Recorder: record.NewFakeRecorder(10),
-				Tracer:   asmetrics.NewNoOp(),
+				Client:           client,
+				Scheme:           scheme,
+				WarmSandboxQueue: queue.NewSimplePodQueue(),
+				Recorder:         record.NewFakeRecorder(10),
+				Tracer:           asmetrics.NewNoOp(),
+			}
+
+			// Pre-populate PodQueue with any existing pods
+			for _, obj := range allObjects {
+				if sb, ok := obj.(*sandboxv1alpha1.Sandbox); ok {
+					if isAdoptable(sb) != nil {
+						continue
+					}
+					hash := sb.Labels[sandboxTemplateRefHash]
+					key := queue.SandboxKey{Namespace: sb.Namespace, Name: sb.Name}
+					reconciler.WarmSandboxQueue.Add(hash, key)
+				}
 			}
 
 			req := reconcile.Request{
@@ -596,10 +610,11 @@ func TestSandboxClaimCleanupPolicy(t *testing.T) {
 				WithStatusSubresource(tc.claim).Build()
 
 			reconciler := &SandboxClaimReconciler{
-				Client:   client,
-				Scheme:   scheme,
-				Recorder: record.NewFakeRecorder(10),
-				Tracer:   asmetrics.NewNoOp(),
+				Client:           client,
+				Scheme:           scheme,
+				WarmSandboxQueue: queue.NewSimplePodQueue(),
+				Recorder:         record.NewFakeRecorder(10),
+				Tracer:           asmetrics.NewNoOp(),
 			}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: tc.claim.Name, Namespace: "default"}}
@@ -674,10 +689,11 @@ func TestSandboxProvisionEvent(t *testing.T) {
 		WithStatusSubresource(claim).Build()
 
 	reconciler := &SandboxClaimReconciler{
-		Client:   client,
-		Scheme:   scheme,
-		Recorder: fakeRecorder,
-		Tracer:   asmetrics.NewNoOp(),
+		Client:           client,
+		Scheme:           scheme,
+		WarmSandboxQueue: queue.NewSimplePodQueue(),
+		Recorder:         fakeRecorder,
+		Tracer:           asmetrics.NewNoOp(),
 	}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: claimName, Namespace: "default"}}
@@ -959,10 +975,11 @@ func TestSandboxClaimSandboxAdoption(t *testing.T) {
 			}
 
 			reconciler := &SandboxClaimReconciler{
-				Client:   fakeClient,
-				Scheme:   scheme,
-				Recorder: record.NewFakeRecorder(10),
-				Tracer:   asmetrics.NewNoOp(),
+				Client:           fakeClient,
+				Scheme:           scheme,
+				WarmSandboxQueue: queue.NewSimplePodQueue(),
+				Recorder:         record.NewFakeRecorder(10),
+				Tracer:           asmetrics.NewNoOp(),
 			}
 
 			req := reconcile.Request{
@@ -1090,10 +1107,11 @@ func TestSandboxClaimNoReAdoption(t *testing.T) {
 		Build()
 
 	reconciler := &SandboxClaimReconciler{
-		Client:   fakeClient,
-		Scheme:   scheme,
-		Recorder: record.NewFakeRecorder(10),
-		Tracer:   asmetrics.NewNoOp(),
+		Client:           fakeClient,
+		Scheme:           scheme,
+		WarmSandboxQueue: queue.NewSimplePodQueue(),
+		Recorder:         record.NewFakeRecorder(10),
+		Tracer:           asmetrics.NewNoOp(),
 	}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
@@ -1215,10 +1233,11 @@ func TestSandboxClaimCreationMetric(t *testing.T) {
 		scheme := newScheme(t)
 		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(template, claim).WithStatusSubresource(claim).Build()
 		reconciler := &SandboxClaimReconciler{
-			Client:   client,
-			Scheme:   scheme,
-			Recorder: record.NewFakeRecorder(10),
-			Tracer:   asmetrics.NewNoOp(),
+			Client:           client,
+			Scheme:           scheme,
+			WarmSandboxQueue: queue.NewSimplePodQueue(),
+			Recorder:         record.NewFakeRecorder(10),
+			Tracer:           asmetrics.NewNoOp(),
 		}
 
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: claim.Name, Namespace: "default"}}
@@ -1271,10 +1290,11 @@ func TestSandboxClaimCreationMetric(t *testing.T) {
 		scheme := newScheme(t)
 		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(template, claim, warmSandbox).WithStatusSubresource(claim).Build()
 		reconciler := &SandboxClaimReconciler{
-			Client:   client,
-			Scheme:   scheme,
-			Recorder: record.NewFakeRecorder(10),
-			Tracer:   asmetrics.NewNoOp(),
+			Client:           client,
+			Scheme:           scheme,
+			WarmSandboxQueue: queue.NewSimplePodQueue(),
+			Recorder:         record.NewFakeRecorder(10),
+			Tracer:           asmetrics.NewNoOp(),
 		}
 
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: claim.Name, Namespace: "default"}}
