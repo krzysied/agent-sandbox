@@ -21,6 +21,7 @@ import (
 	"sort"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -189,11 +190,18 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		sandboxesToCreate := desiredReplicas - currentReplicas
 		log.Info("Creating new pool sandboxes", "count", sandboxesToCreate)
 
+		g, ctx := errgroup.WithContext(ctx)
 		for i := int32(0); i < sandboxesToCreate; i++ {
-			if err := r.createPoolSandbox(ctx, warmPool, poolNameHash); err != nil {
-				log.Error(err, "Failed to create pool sandbox")
-				allErrors = errors.Join(allErrors, err)
-			}
+			g.Go(func() error {
+				if err := r.createPoolSandbox(ctx, warmPool, poolNameHash); err != nil {
+					return fmt.Errorf("failed to create warm pool %v/%v sandobox: %v", warmPool.Namespace, warmPool.Name, err)
+				}
+				return nil
+			})
+
+		}
+		if err := g.Wait(); err != nil {
+			allErrors = errors.Join(allErrors, err)
 		}
 	}
 
