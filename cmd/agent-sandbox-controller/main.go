@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	extensionscontrollers "sigs.k8s.io/agent-sandbox/extensions/controllers"
+	extensionsclient "sigs.k8s.io/agent-sandbox/extensions/controllers/client"
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	//+kubebuilder:scaffold:imports
@@ -189,6 +190,10 @@ func main() {
 	restConfig := ctrl.GetConfigOrDie()
 	restConfig.QPS = float32(kubeAPIQPS)
 	restConfig.Burst = kubeAPIBurst
+	// Wrap the transport
+	restConfig.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
+		return &extensionsclient.NoRetryTransport{Transport: rt}
+	}
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                  scheme,
