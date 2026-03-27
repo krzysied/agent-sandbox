@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	agentclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
+	extclientset "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned"
 	"sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	extensionscontrollers "sigs.k8s.io/agent-sandbox/extensions/controllers"
@@ -188,12 +190,16 @@ func main() {
 	}
 
 	restConfig := ctrl.GetConfigOrDie()
+	//restConfig := kube_client.
 	restConfig.QPS = float32(kubeAPIQPS)
 	restConfig.Burst = kubeAPIBurst
 	// Wrap the transport
 	restConfig.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
 		return &extensionsclient.NoRetryTransport{Transport: rt}
 	}
+
+	extClient := extclientset.NewForConfigOrDie(restConfig)
+	agnetClient := agentclientset.NewForConfigOrDie(restConfig)
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                  scheme,
@@ -223,13 +229,19 @@ func main() {
 	if extensions {
 		warmSandboxQueue := queue.NewSimplePodQueue()
 		defer warmSandboxQueue.Shutdown()
-		if err = (&extensionscontrollers.SandboxClaimReconciler{
-			Client:           mgr.GetClient(),
+		scc := &extensionscontrollers.SandboxClaimReconciler{
+			Client: mgr.GetClient(),
+			CombinedClient: &extensionscontrollers.CombinedClient{
+				ExtClient:   extClient,
+				AgentClient: agnetClient,
+			},
 			Scheme:           mgr.GetScheme(),
 			WarmSandboxQueue: warmSandboxQueue,
 			Recorder:         mgr.GetEventRecorderFor("sandboxclaim-controller"),
 			Tracer:           instrumenter,
-		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
+		}
+		scc.Cache = extensionscontrollers.NewUpdatableCache(scc.Client)
+		if err = (scc).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
 			os.Exit(1)
 		}

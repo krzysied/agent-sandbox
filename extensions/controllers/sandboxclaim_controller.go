@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	agnetclientset "sigs.k8s.io/agent-sandbox/clients/k8s/clientset/versioned"
+	extclientset "sigs.k8s.io/agent-sandbox/clients/k8s/extensions/clientset/versioned"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -51,11 +55,153 @@ var ErrTemplateNotFound = errors.New("SandboxTemplate not found")
 // SandboxClaimReconciler reconciles a SandboxClaim object
 type SandboxClaimReconciler struct {
 	client.Client
+	CombinedClient          *CombinedClient
 	Scheme                  *runtime.Scheme
 	WarmSandboxQueue        queue.SandboxQueue
+	Cache                   *UpdatableCache
 	Recorder                record.EventRecorder
 	Tracer                  asmetrics.Instrumenter
 	MaxConcurrentReconciles int
+}
+
+type CombinedClient struct {
+	ExtClient   *extclientset.Clientset
+	AgentClient *agnetclientset.Clientset
+}
+
+type UpdatableCache struct {
+	cacheClient client.Client
+
+	sandboxMu       sync.Mutex
+	sandboxOverride map[client.ObjectKey]*v1alpha1.Sandbox
+
+	sandboxClaimMu       sync.Mutex
+	sandboxClaimOverride map[client.ObjectKey]*extensionsv1alpha1.SandboxClaim
+
+	assignmentMu  sync.RWMutex
+	assignmentMap map[client.ObjectKey]client.ObjectKey
+}
+
+func NewUpdatableCache(c client.Client) *UpdatableCache {
+	return &UpdatableCache{
+		cacheClient:          c,
+		sandboxOverride:      map[client.ObjectKey]*v1alpha1.Sandbox{},
+		sandboxClaimOverride: map[client.ObjectKey]*extensionsv1alpha1.SandboxClaim{},
+		assignmentMap:        map[client.ObjectKey]client.ObjectKey{},
+	}
+}
+
+func (u *UpdatableCache) GetAssignmnet(ctx context.Context, claimKey client.ObjectKey) (client.ObjectKey, bool) {
+	u.assignmentMu.RLock()
+	defer u.assignmentMu.RUnlock()
+	sandboxKey, exists := u.assignmentMap[claimKey]
+	return sandboxKey, exists
+}
+
+func (u *UpdatableCache) SetAssignment(ctx context.Context, claimKey, sandboxKey client.ObjectKey) {
+	u.assignmentMu.Lock()
+	defer u.assignmentMu.Unlock()
+	u.assignmentMap[claimKey] = sandboxKey
+}
+
+func (u *UpdatableCache) DeleteAssignment(ctx context.Context, claimKey client.ObjectKey) {
+	u.assignmentMu.Lock()
+	defer u.assignmentMu.Unlock()
+	delete(u.assignmentMap, claimKey)
+}
+
+func (u *UpdatableCache) GetSandbox(ctx context.Context, key client.ObjectKey) (*v1alpha1.Sandbox, error) {
+	obj := &v1alpha1.Sandbox{}
+	err := u.cacheClient.Get(ctx, key, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	u.sandboxMu.Lock()
+	defer u.sandboxMu.Unlock()
+	s, ok := u.sandboxOverride[key]
+	if !ok {
+		// No override
+		return obj, nil
+	}
+
+	isLess := ResourceVersionLess(obj.ResourceVersion, s.ResourceVersion)
+	if err != nil {
+		return obj, nil
+	}
+
+	if isLess {
+		log.FromContext(ctx).Info(fmt.Sprintf("[debug] Override cache for %v", key))
+		// Override has newer version.
+		return s.DeepCopy(), nil
+	}
+	// Clean up cache when not needed.
+	delete(u.sandboxOverride, key)
+	return obj, nil
+}
+
+func (u *UpdatableCache) UpdateSandbox(ctx context.Context, obj *v1alpha1.Sandbox) {
+	u.sandboxMu.Lock()
+	defer u.sandboxMu.Unlock()
+
+	u.sandboxOverride[client.ObjectKeyFromObject(obj)] = obj.DeepCopy()
+}
+
+func (u *UpdatableCache) GetSandboxClaim(ctx context.Context, key client.ObjectKey) (*extensionsv1alpha1.SandboxClaim, error) {
+	obj := &extensionsv1alpha1.SandboxClaim{}
+	err := u.cacheClient.Get(ctx, key, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	u.sandboxClaimMu.Lock()
+	defer u.sandboxClaimMu.Unlock()
+	s, ok := u.sandboxClaimOverride[key]
+	if !ok {
+		// No override
+		return obj, nil
+	}
+
+	isLess := ResourceVersionLess(obj.ResourceVersion, s.ResourceVersion)
+	if err != nil {
+		return obj, nil
+	}
+
+	if isLess {
+		log.FromContext(ctx).Info(fmt.Sprintf("[debug] Override cache for %v", key))
+		// Override has newer version.
+		return s.DeepCopy(), nil
+	}
+	// Clean up cache when not needed.
+	delete(u.sandboxClaimOverride, key)
+	return obj, nil
+}
+
+func (u *UpdatableCache) UpdateSandboxClaim(ctx context.Context, obj *extensionsv1alpha1.SandboxClaim) {
+	u.sandboxClaimMu.Lock()
+	defer u.sandboxClaimMu.Unlock()
+
+	u.sandboxClaimOverride[client.ObjectKeyFromObject(obj)] = obj.DeepCopy()
+}
+
+func ResourceVersionLess(a, b string) bool {
+	// both are well-formed integer strings with no leading zeros
+	aLen := len(a)
+	bLen := len(b)
+	switch {
+	case aLen < bLen:
+		// shorter is less
+		return true
+	case aLen > bLen:
+		// longer is greater
+		return false
+	default:
+		// equal-length compares lexically
+		if strings.Compare(a, b) == -1 {
+			return true
+		}
+	}
+	return false
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
@@ -71,8 +217,9 @@ type SandboxClaimReconciler struct {
 // move the current state of the cluster closer to the desired state.
 func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	claim := &extensionsv1alpha1.SandboxClaim{}
-	if err := r.Get(ctx, req.NamespacedName, claim); err != nil {
+
+	claim, err := r.Cache.GetSandboxClaim(ctx, req.NamespacedName)
+	if err != nil {
 		if k8errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -142,7 +289,8 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			break
 		}
 		// Update Status & Events
-		if err := r.Get(ctx, req.NamespacedName, claim); err != nil {
+		claim, err := r.Cache.GetSandboxClaim(ctx, req.NamespacedName)
+		if err != nil {
 			if k8errors.IsNotFound(err) {
 				return ctrl.Result{}, nil
 			}
@@ -242,10 +390,12 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 // reconcileExpired ensures the Sandbox is deleted for Retained claims.
 func (r *SandboxClaimReconciler) reconcileExpired(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim) (*v1alpha1.Sandbox, error) {
 	log := log.FromContext(ctx)
-	sandbox := &v1alpha1.Sandbox{}
+	//sandbox := &v1alpha1.Sandbox{}
 
 	// Check if Sandbox exists
-	if err := r.Get(ctx, client.ObjectKeyFromObject(claim), sandbox); err != nil {
+	//if err := r.Get(ctx, client.ObjectKeyFromObject(claim), sandbox); err != nil {
+	sandbox, err := r.Cache.GetSandbox(ctx, client.ObjectKeyFromObject(claim))
+	if err != nil {
 		if k8errors.IsNotFound(err) {
 			return nil, nil // Sandbox is gone, life is good.
 		}
@@ -277,10 +427,14 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, claim); err != nil {
+	log.Info(fmt.Sprintf("%v/%v sandbox claim status update: %+v", claim.Namespace, claim.Name, claim.Status))
+	updated, err := r.CombinedClient.ExtClient.ExtensionsV1alpha1().SandboxClaims(claim.Namespace).UpdateStatus(ctx, claim, metav1.UpdateOptions{})
+	//if err := r.Status().Update(ctx, claim); err != nil {
+	if err != nil {
 		log.Error(err, "Failed to update sandboxclaim status")
 		return err
 	}
+	r.Cache.UpdateSandboxClaim(ctx, updated)
 
 	return nil
 }
@@ -383,8 +537,9 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 		defer r.WarmSandboxQueue.Done(templateHash, adoptedKey)
 
 		log.Info(fmt.Sprintf("[debug] %v trying to adopt %v", claim.Name, adoptedKey))
-		adopted := &v1alpha1.Sandbox{}
-		err := r.Get(ctx, client.ObjectKey(adoptedKey), adopted)
+		//adopted := &v1alpha1.Sandbox{}
+		//err := r.Get(ctx, client.ObjectKey(adoptedKey), adopted)
+		adopted, err := r.Cache.GetSandbox(ctx, client.ObjectKey(adoptedKey))
 		if err != nil {
 			if k8errors.IsNotFound(err) {
 				// Sandbox is gone.
@@ -429,9 +584,12 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 		}
 		adopted.Spec.PodTemplate.ObjectMeta.Labels[extensionsv1alpha1.SandboxIDLabel] = string(claim.UID)
 
+		log.Info(fmt.Sprintf("[debug] Updating adopted sandbox %v/%v: %+v", adopted.Namespace, adopted.Name, adopted))
 		// Update uses optimistic concurrency (resourceVersion) so concurrent
 		// claims racing to adopt the same sandbox will conflict and retry.
-		if err := r.Update(ctx, adopted); err != nil {
+		//r.ExtClient.ExtensionsV1alpha1().Sandbox().Update(ctx, adopted, metav1.UpdateOptions{})
+		updatedObj, err := r.CombinedClient.AgentClient.AgentsV1alpha1().Sandboxes(adopted.Namespace).Update(ctx, adopted, metav1.UpdateOptions{})
+		if err != nil {
 			if k8errors.IsConflict(err) {
 				// Unexpected conflic. Requeue key.
 				r.WarmSandboxQueue.Add(templateHash, adoptedKey)
@@ -446,6 +604,8 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			log.Error(err, fmt.Sprintf("[debug] Failed to update adopted sandbox %v/%v", adopted.Namespace, adopted.Name))
 			return nil, err
 		}
+		log.Info(fmt.Sprintf("[debug] Updating sandbox %v/%v in cache: %+v", updatedObj.Namespace, updatedObj.Name, updatedObj))
+		r.Cache.UpdateSandbox(ctx, updatedObj)
 
 		log.Info("[debug] Successfully adopted sandbox from warm pool", "sandbox", adopted.Name, "claim", claim.Name)
 
@@ -562,15 +722,22 @@ func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *exten
 func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *extensionsv1alpha1.SandboxClaim, _ *extensionsv1alpha1.SandboxTemplate) (*v1alpha1.Sandbox, error) {
 	logger := log.FromContext(ctx)
 
+	logger.Info(fmt.Sprintf("[debug] %v/%v sandbox claim status: %+v", claim.Namespace, claim.Name, claim.Status))
 	// Check if a previously adopted sandbox is recorded in claim status
 	if statusName := claim.Status.SandboxStatus.Name; statusName != "" {
-		sandbox := &v1alpha1.Sandbox{}
-		if err := r.Get(ctx, client.ObjectKey{Namespace: claim.Namespace, Name: statusName}, sandbox); err == nil {
+		//sandbox := &v1alpha1.Sandbox{}
+		sandbox, err := r.Cache.GetSandbox(ctx, client.ObjectKey{Namespace: claim.Namespace, Name: statusName})
+		if err == nil {
+			logger.Info(fmt.Sprintf("[debug] %v/%v sandbox claim, found existing sandbox (status): %+v", claim.Namespace, claim.Name, sandbox))
+			//if err := r.Get(ctx, client.ObjectKey{Namespace: claim.Namespace, Name: statusName}, sandbox); err == nil {
 			if metav1.IsControlledBy(sandbox, claim) {
-				logger.Info("found existing adopted sandbox from status", "name", statusName)
+				logger.Info(fmt.Sprintf("[debug] %v/%v found existing adopted sandbox from status: %v", claim.Namespace, claim.Name, statusName))
 				return sandbox, nil
 			}
-		} else if !k8errors.IsNotFound(err) {
+		} else if k8errors.IsNotFound(err) {
+			logger.Error(err, fmt.Sprintf("[debug] %v/%v not found existing adopted sandbox from status: %v", claim.Namespace, claim.Name, statusName))
+		} else {
+			logger.Error(err, fmt.Sprintf("[debug] %v/%v unexpected error adopted sandbox from status: %v", claim.Namespace, claim.Name, statusName))
 			return nil, fmt.Errorf("failed to get sandbox %q from status: %w", statusName, err)
 		}
 	}
@@ -582,10 +749,25 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 			Name:      claim.Name,
 		},
 	}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), sandbox); err != nil {
+	var err error
+	sandbox, err = r.Cache.GetSandbox(ctx, client.ObjectKeyFromObject(sandbox))
+	//if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), sandbox); err != nil {
+	if err != nil {
 		sandbox = nil
 		if !k8errors.IsNotFound(err) {
 			return nil, fmt.Errorf("failed to get sandbox %q: %w", claim.Name, err)
+		}
+	}
+
+	sandboxKey, ok := r.Cache.GetAssignmnet(ctx, client.ObjectKeyFromObject(claim))
+	if ok {
+		sandbox, err = r.Cache.GetSandbox(ctx, sandboxKey)
+		if err != nil {
+			if !k8errors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to get sandbox %q: %w", claim.Name, err)
+			} else {
+				r.Cache.DeleteAssignment(ctx, sandboxKey)
+			}
 		}
 	}
 
@@ -604,6 +786,7 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 		return nil, err
 	}
 	if adopted != nil {
+		r.Cache.SetAssignment(ctx, client.ObjectKeyFromObject(claim), sandboxKey)
 		return adopted, nil
 	}
 
